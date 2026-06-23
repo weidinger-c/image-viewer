@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import concurrent.futures
+import hashlib
 import json
 import os
 import sys
@@ -22,8 +24,12 @@ SUPPORTED_EXTENSIONS = frozenset({
     '.pgm', '.png', '.ppm', '.tif', '.tiff', '.webp',
 })
 
-PRELOAD_AHEAD = 2
-PRELOAD_BEHIND = 1
+VERSION = '0.1.0'
+PRELOAD_AHEAD = 3
+PRELOAD_BEHIND = 2
+_POOL_WORKERS = 4
+THUMB_SIZE = 160
+_MODEL_BATCH = 2000  # strings to splice per idle frame
 CONFIG_FILENAME = 'settings.json'
 CONFIG_DIR_NAME = 'image-viewer'
 
@@ -47,11 +53,24 @@ class ImageViewer(Gtk.ApplicationWindow):
     self._drag_start_v: float = 0.0
     self._settings_path = self._get_settings_path()
     self._dark_mode = self._load_dark_mode_setting()
+    self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=_POOL_WORKERS)
+    self._pending_futures: list[concurrent.futures.Future] = []
+    self._gallery_mode: bool = False
+    self._gallery_selected: int = 0
+    self._gallery_gen: int = 0
+    self._thumb_widgets: list[Gtk.Image] = []
+    self._thumb_futures: list[concurrent.futures.Future] = []
+    self._thumb_cache_dir: Path = self._get_thumb_cache_dir()
+    self._thumb_cache_mem: dict[str, GdkPixbuf.Pixbuf] = {}
+    self._thumb_submitted: set[str] = set()
+    self._gallery_img_widgets: dict[str, Gtk.Image] = {}
+    self._gallery_populated_images: list[str] | None = None
 
     self._apply_theme()
 
     self.set_default_size(1200, 800)
     self._build_ui()
+    self.connect('destroy', self._on_destroy)
     self.present()
 
     GLib.idle_add(self._load_path, start_path)
@@ -81,6 +100,64 @@ class ImageViewer(Gtk.ApplicationWindow):
     self._da.set_hexpand(True)
     self._da.set_vexpand(True)
     self._scroll.set_child(self._da)
+
+    # ---- gallery panel --------------------------------------------
+    self._gallery_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+    self._gallery_box.set_vexpand(True)
+    self._gallery_box.set_visible(False)
+
+    _toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    _toolbar.set_margin_start(8)
+    _toolbar.set_margin_end(8)
+    _toolbar.set_margin_top(6)
+    _toolbar.set_margin_bottom(6)
+    self._gallery_cache_label = Gtk.Label(label='')
+    self._gallery_cache_label.set_halign(Gtk.Align.START)
+    self._gallery_cache_label.set_hexpand(True)
+    _clear_btn = Gtk.Button(label='Clear thumbnail cache')
+    _clear_btn.connect('clicked', self._on_wipe_cache)
+    _toolbar.append(self._gallery_cache_label)
+    _toolbar.append(_clear_btn)
+    self._gallery_box.append(_toolbar)
+    self._gallery_box.append(
+        Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+    self._gallery_scroll = Gtk.ScrolledWindow()
+    self._gallery_scroll.set_vexpand(True)
+    self._gallery_scroll.set_policy(
+        Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    self._model = Gtk.StringList(strings=[])
+    self._gallery_selection = Gtk.SingleSelection(model=self._model)
+    self._gallery_selection.set_autoselect(False)
+    self._gallery_selection.connect(
+        'selection-changed', self._on_gallery_selection_changed)
+    _factory = Gtk.SignalListItemFactory()
+    _factory.connect('setup', self._gallery_setup_item)
+    _factory.connect('bind', self._gallery_bind_item)
+    _factory.connect('unbind', self._gallery_unbind_item)
+    self._grid_view = Gtk.GridView(
+        model=self._gallery_selection, factory=_factory)
+    self._grid_view.set_min_columns(1)
+    self._grid_view.set_max_columns(99)
+    self._grid_view.set_margin_start(12)
+    self._grid_view.set_margin_end(12)
+    self._grid_view.set_margin_top(12)
+    self._grid_view.set_margin_bottom(12)
+    self._grid_view.connect('activate', self._on_gallery_activate)
+    self._gallery_scroll.set_child(self._grid_view)
+    self._gallery_box.append(self._gallery_scroll)
+    vbox.append(self._gallery_box)
+
+    _gallery_css = b'''
+      .thumb-placeholder { background-color: rgba(60,60,60,1); }
+      .thumb-label { font-size: 10px; color: #888888; }
+    '''
+    _gp = Gtk.CssProvider()
+    _gp.load_from_data(_gallery_css)
+    Gtk.StyleContext.add_provider_for_display(
+        Gdk.Display.get_default(), _gp,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    # ----------------------------------------------------------------
 
     self._status = Gtk.Label(label='Loading…')
     self._status.set_halign(Gtk.Align.START)
@@ -141,6 +218,7 @@ class ImageViewer(Gtk.ApplicationWindow):
         ]),
         ('View', [
             ('F / F11', 'Toggle fullscreen'),
+            ('G', 'Toggle gallery view'),
           ('D', 'Toggle dark mode'),
             ('Left-drag', 'Pan (when zoomed)'),
         ]),
@@ -190,6 +268,11 @@ class ImageViewer(Gtk.ApplicationWindow):
     hint.set_margin_top(16)
     outer.append(hint)
 
+    ver = Gtk.Label(label=f'v{VERSION}')
+    ver.add_css_class('help-version')
+    ver.set_margin_top(4)
+    outer.append(ver)
+
     # Apply CSS
     css = b'''
       .help-panel {
@@ -215,6 +298,10 @@ class ImageViewer(Gtk.ApplicationWindow):
       .help-hint {
         font-size: 11px;
         color: #666666;
+      }
+      .help-version {
+        font-size: 10px;
+        color: #444444;
       }
     '''
     provider = Gtk.CssProvider()
@@ -254,11 +341,13 @@ class ImageViewer(Gtk.ApplicationWindow):
     self.present()
 
   def _scan_folder(self, folder: Path, start: str | None) -> None:
-    images = sorted(
-        str(f)
-        for f in folder.iterdir()
-        if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
-    )
+    with os.scandir(folder) as it:
+      images = sorted(
+          e.path
+          for e in it
+          if e.is_file(follow_symlinks=False)
+          and os.path.splitext(e.name)[1].lower() in SUPPORTED_EXTENSIONS
+      )
     if not images:
       GLib.idle_add(self._status.set_text, 'No images found in folder.')
       return
@@ -320,22 +409,43 @@ class ImageViewer(Gtk.ApplicationWindow):
     if not self._images:
       return
     path = self._images[self._index]
-    pixbuf = self._get_pixbuf(path)
-    if pixbuf:
-      self._render(pixbuf)
     name = Path(path).name
     self.set_title(f'{name} — Image Viewer')
     self._update_status()
     self._schedule_preload()
 
+    with self._cache_lock:
+      cached = self._cache.get(path)
+    if cached is not None:
+      self._render(cached)
+    else:
+      self._executor.submit(self._load_and_show, path, self._index)
+
+  def _load_and_show(self, path: str, index: int) -> None:
+    pb = self._get_pixbuf(path)
+    if pb is None:
+      return
+
+    def on_main() -> bool:
+      if self._index == index:
+        self._render(pb)
+      return False
+
+    GLib.idle_add(on_main)
+
   def _update_status(self) -> None:
     if not self._images:
       return
-    name = Path(self._images[self._index]).name
-    zoom_str = f'{self._zoom * 100:.0f}%' if self._zoom > 0.0 else 'fit'
+    if self._gallery_mode:
+      idx = self._gallery_selected
+      zoom_str = 'gallery'
+    else:
+      idx = self._index
+      zoom_str = f'{self._zoom * 100:.0f}%' if self._zoom > 0.0 else 'fit'
+    name = Path(self._images[idx]).name
     theme_str = 'dark' if self._dark_mode else 'light'
     self._status.set_text(
-        f'  {self._index + 1} / {len(self._images)}   {name}   '
+        f'  {idx + 1} / {len(self._images)}   {name}   '
         f'[{zoom_str}, {theme_str}]')
 
   def _render(self, pixbuf: GdkPixbuf.Pixbuf) -> None:
@@ -416,7 +526,16 @@ class ImageViewer(Gtk.ApplicationWindow):
       if key not in keep:
         del self._cache[key]
 
+  def _on_destroy(self, _widget) -> None:
+    for fut in self._thumb_futures:
+      fut.cancel()
+    self._executor.shutdown(wait=False, cancel_futures=True)
+
   def _schedule_preload(self) -> None:
+    for fut in self._pending_futures:
+      fut.cancel()
+    self._pending_futures.clear()
+
     for sign, limit in ((1, PRELOAD_AHEAD), (-1, PRELOAD_BEHIND)):
       for step in range(1, limit + 1):
         i = self._index + sign * step
@@ -425,9 +544,241 @@ class ImageViewer(Gtk.ApplicationWindow):
           with self._cache_lock:
             if path in self._cache:
               continue
-          threading.Thread(
-              target=self._get_pixbuf, args=(path,), daemon=True
-          ).start()
+          fut = self._executor.submit(self._get_pixbuf, path)
+          self._pending_futures.append(fut)
+
+  # ------------------------------------------------------------------ #
+  # Gallery                                                              #
+  # ------------------------------------------------------------------ #
+
+  def _get_thumb_cache_dir(self) -> Path:
+    cache_home = Path(os.environ.get('XDG_CACHE_HOME',
+                                     str(Path.home() / '.cache')))
+    return cache_home / CONFIG_DIR_NAME / 'thumbs'
+
+  def _thumb_cache_path(self, image_path: str) -> Path:
+    try:
+      mtime = int(Path(image_path).stat().st_mtime)
+    except OSError:
+      mtime = 0
+    key = hashlib.md5(image_path.encode()).hexdigest()
+    return self._thumb_cache_dir / f'{key}_{mtime}.png'
+
+  def _load_thumbnail(self, image_path: str) -> GdkPixbuf.Pixbuf | None:
+    cache_path = self._thumb_cache_path(image_path)
+    if cache_path.exists():
+      try:
+        return GdkPixbuf.Pixbuf.new_from_file(str(cache_path))
+      except Exception:
+        pass
+    try:
+      pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+          image_path, THUMB_SIZE, THUMB_SIZE, True)
+    except Exception as exc:
+      print(f'Cannot generate thumbnail for {image_path}: {exc}',
+            file=sys.stderr)
+      return None
+    try:
+      self._thumb_cache_dir.mkdir(parents=True, exist_ok=True)
+      pb.savev(str(cache_path), 'png', [], [])
+    except Exception as exc:
+      print(f'Cannot save thumbnail to {cache_path}: {exc}', file=sys.stderr)
+    return pb
+
+  def _load_thumbnail_for_gallery(self, path: str, gen: int) -> None:
+    pb = self._load_thumbnail(path)
+    if pb is None:
+      return
+
+    def on_main() -> bool:
+      if self._gallery_mode and self._gallery_gen == gen:
+        self._thumb_cache_mem[path] = pb
+        img = self._gallery_img_widgets.get(path)
+        if img is not None:
+          img.set_from_pixbuf(pb)
+          img.remove_css_class('thumb-placeholder')
+      return False
+
+    GLib.idle_add(on_main)
+
+  def _toggle_gallery(self) -> None:
+    if self._gallery_mode:
+      self._close_gallery()
+    elif self._images:
+      self._open_gallery()
+
+  def _open_gallery(self) -> None:
+    self._gallery_mode = True
+    self._gallery_selected = self._index
+    self._gallery_gen += 1
+    self._thumb_submitted.clear()
+    self._gallery_img_widgets.clear()
+    self._update_status()
+    self._scroll.set_visible(False)
+    self._gallery_box.set_visible(True)
+    self._update_cache_label()
+    if self._gallery_populated_images is not self._images:
+      # New folder — create a fresh model (O(1)) and populate in batches.
+      self._gallery_populated_images = self._images
+      self._model = Gtk.StringList(strings=[])
+      self._gallery_selection = Gtk.SingleSelection(model=self._model)
+      self._gallery_selection.set_autoselect(False)
+      self._gallery_selection.connect(
+          'selection-changed', self._on_gallery_selection_changed)
+      self._grid_view.set_model(self._gallery_selection)
+      GLib.idle_add(self._populate_model_batch, 0, self._gallery_gen)
+    else:
+      # Same folder — model already populated, just reselect.
+      self._gallery_selection.set_selected(self._gallery_selected)
+      GLib.idle_add(self._scroll_gallery_to, self._gallery_selected)
+
+  def _populate_model_batch(self, start: int, gen: int) -> bool:
+    if not self._gallery_mode or self._gallery_gen != gen:
+      return False
+    end = min(start + _MODEL_BATCH, len(self._images))
+    self._model.splice(start, 0, self._images[start:end])
+    if end < len(self._images):
+      GLib.idle_add(self._populate_model_batch, end, gen)
+    else:
+      self._gallery_selection.set_selected(self._gallery_selected)
+      GLib.idle_add(self._scroll_gallery_to, self._gallery_selected)
+    return False
+
+  def _close_gallery(self) -> None:
+    self._gallery_mode = False
+    self._gallery_box.set_visible(False)
+    self._scroll.set_visible(True)
+    for fut in self._thumb_futures:
+      fut.cancel()
+    self._thumb_futures.clear()
+    self._gallery_img_widgets.clear()
+    # Keep the model alive — re-opening the same folder is then instant.
+
+  def _gallery_setup_item(
+      self, _factory: Gtk.SignalListItemFactory,
+      list_item: Gtk.ListItem) -> None:
+    cell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+    cell.set_margin_start(4)
+    cell.set_margin_end(4)
+    cell.set_margin_top(4)
+    cell.set_margin_bottom(4)
+    img = Gtk.Image()
+    img.set_size_request(THUMB_SIZE, THUMB_SIZE)
+    img.add_css_class('thumb-placeholder')
+    cell.append(img)
+    lbl = Gtk.Label()
+    lbl.add_css_class('thumb-label')
+    cell.append(lbl)
+    list_item.set_child(cell)
+
+  def _gallery_bind_item(
+      self, _factory: Gtk.SignalListItemFactory,
+      list_item: Gtk.ListItem) -> None:
+    path = list_item.get_item().get_string()
+    cell = list_item.get_child()
+    img: Gtk.Image = cell.get_first_child()
+    lbl: Gtk.Label = img.get_next_sibling()
+
+    name = Path(path).name
+    if len(name) > 18:
+      name = name[:15] + '…'
+    lbl.set_label(name)
+
+    self._gallery_img_widgets[path] = img
+    cached = self._thumb_cache_mem.get(path)
+    if cached is not None:
+      img.set_from_pixbuf(cached)
+      img.remove_css_class('thumb-placeholder')
+    else:
+      img.clear()
+      img.add_css_class('thumb-placeholder')
+      if path not in self._thumb_submitted:
+        self._thumb_submitted.add(path)
+        gen = self._gallery_gen
+        fut = self._executor.submit(
+            self._load_thumbnail_for_gallery, path, gen)
+        self._thumb_futures.append(fut)
+
+  def _gallery_unbind_item(
+      self, _factory: Gtk.SignalListItemFactory,
+      list_item: Gtk.ListItem) -> None:
+    path = list_item.get_item().get_string()
+    self._gallery_img_widgets.pop(path, None)
+
+  def _gallery_move_selection(self, delta: int) -> None:
+    n = self._model.get_n_items()
+    if n == 0:
+      return
+    self._gallery_selected = max(
+        0, min(self._gallery_selected + delta, n - 1))
+    self._gallery_selection.set_selected(self._gallery_selected)
+    GLib.idle_add(self._scroll_gallery_to, self._gallery_selected)
+
+  def _scroll_gallery_to(self, index: int) -> bool:
+    try:
+      self._grid_view.scroll_to(index, Gtk.ListScrollFlags.FOCUS, None)
+    except AttributeError:
+      pass  # scroll_to added in GTK 4.12
+    return False
+
+  def _on_gallery_activate(self, _grid_view: Gtk.GridView,
+                            position: int) -> None:
+    if not self._gallery_mode:
+      return
+    self._index = position
+    self._zoom = 0.0
+    self._close_gallery()
+    self._show_current()
+
+  def _update_cache_label(self) -> None:
+    self._gallery_cache_label.set_text('Thumbnail cache: counting…')
+    self._executor.submit(self._compute_cache_label)
+
+  def _compute_cache_label(self) -> None:
+    d = self._thumb_cache_dir
+    if not d.exists():
+      GLib.idle_add(self._gallery_cache_label.set_text, 'Thumbnail cache: empty')
+      return
+    files = list(d.glob('*.png'))
+    if not files:
+      GLib.idle_add(self._gallery_cache_label.set_text, 'Thumbnail cache: empty')
+      return
+    total = sum(f.stat().st_size for f in files)
+    size_str = (f'{total / 1_048_576:.1f} MB'
+                if total >= 1_048_576 else f'{total // 1024} KB')
+    GLib.idle_add(self._gallery_cache_label.set_text,
+                  f'Thumbnail cache: {len(files)} files · {size_str}')
+
+  def _on_wipe_cache(self, _btn) -> None:
+    d = self._thumb_cache_dir
+    if d.exists():
+      for f in d.glob('*.png'):
+        try:
+          f.unlink()
+        except OSError:
+          pass
+    self._thumb_cache_mem.clear()
+    self._update_cache_label()
+    if self._gallery_mode:
+      # Force full repopulation so rebind fetches fresh thumbnails.
+      self._gallery_populated_images = None
+      self._gallery_gen += 1
+      self._thumb_submitted.clear()
+      self._gallery_img_widgets.clear()
+      self._model = Gtk.StringList(strings=[])
+      self._gallery_selection = Gtk.SingleSelection(model=self._model)
+      self._gallery_selection.set_autoselect(False)
+      self._gallery_selection.connect(
+          'selection-changed', self._on_gallery_selection_changed)
+      self._grid_view.set_model(self._gallery_selection)
+      GLib.idle_add(self._populate_model_batch, 0, self._gallery_gen)
+
+  def _on_gallery_selection_changed(
+      self, _sel: Gtk.SingleSelection, _pos: int, _n: int) -> None:
+    sel = self._gallery_selection.get_selected()
+    if sel < self._model.get_n_items():
+      self._gallery_selected = sel
+      self._update_status()
 
   # ------------------------------------------------------------------ #
   # Input                                                                #
@@ -435,6 +786,22 @@ class ImageViewer(Gtk.ApplicationWindow):
 
   def _on_key_pressed(
       self, _ctrl, keyval: int, _keycode: int, _state) -> bool:
+    if self._gallery_mode:
+      if keyval in (Gdk.KEY_Right, Gdk.KEY_space, Gdk.KEY_n, Gdk.KEY_Page_Down):
+        self._gallery_move_selection(1)
+      elif keyval in (Gdk.KEY_Left, Gdk.KEY_BackSpace, Gdk.KEY_p, Gdk.KEY_Page_Up):
+        self._gallery_move_selection(-1)
+      elif keyval in (Gdk.KEY_Up, Gdk.KEY_Down):
+        return False  # GridView handles row navigation natively when focused
+      elif keyval == Gdk.KEY_Home:
+        self._gallery_move_selection(-len(self._images))
+      elif keyval == Gdk.KEY_End:
+        self._gallery_move_selection(len(self._images))
+      elif keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+        self._on_gallery_activate(self._grid_view, self._gallery_selected)
+      elif keyval in (Gdk.KEY_g, Gdk.KEY_G, Gdk.KEY_Escape):
+        self._close_gallery()
+      return True
     if keyval in (Gdk.KEY_Right, Gdk.KEY_space, Gdk.KEY_n, Gdk.KEY_Page_Down):
       self._navigate(1)
     elif keyval in (Gdk.KEY_Left, Gdk.KEY_BackSpace, Gdk.KEY_p, Gdk.KEY_Page_Up):
@@ -461,6 +828,8 @@ class ImageViewer(Gtk.ApplicationWindow):
       self._toggle_help()
     elif keyval in (Gdk.KEY_d, Gdk.KEY_D):
       self._toggle_dark_mode()
+    elif keyval in (Gdk.KEY_g, Gdk.KEY_G):
+      self._toggle_gallery()
     elif keyval in (Gdk.KEY_q, Gdk.KEY_Escape):
       if self._help_box.get_visible():
         self._set_help_visible(False)
