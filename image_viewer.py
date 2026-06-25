@@ -41,6 +41,7 @@ class ImageViewer(Gtk.ApplicationWindow):
     super().__init__(application=app, title='Image Viewer')
     self._app = app
     self._images: list[str] = []
+    self._folder: Path | None = None
     self._index: int = 0
     self._cache: dict[str, GdkPixbuf.Pixbuf] = {}
     self._cache_lock = threading.Lock()
@@ -116,7 +117,10 @@ class ImageViewer(Gtk.ApplicationWindow):
     self._gallery_cache_label.set_hexpand(True)
     _clear_btn = Gtk.Button(label='Clear thumbnail cache')
     _clear_btn.connect('clicked', self._on_wipe_cache)
+    _refresh_btn = Gtk.Button(label='Refresh folder')
+    _refresh_btn.connect('clicked', lambda _: self._refresh_folder())
     _toolbar.append(self._gallery_cache_label)
+    _toolbar.append(_refresh_btn)
     _toolbar.append(_clear_btn)
     self._gallery_box.append(_toolbar)
     self._gallery_box.append(
@@ -220,10 +224,12 @@ class ImageViewer(Gtk.ApplicationWindow):
             ('F / F11', 'Toggle fullscreen'),
             ('G', 'Toggle gallery view'),
           ('D', 'Toggle dark mode'),
+            ('R', 'Refresh folder'),
             ('Left-drag', 'Pan (when zoomed)'),
         ]),
         ('Other', [
             ('? / H', 'Show / hide this help'),
+            ('Ctrl + C', 'Copy image to clipboard'),
             ('Q / Esc', 'Quit'),
         ]),
     ]
@@ -330,6 +336,7 @@ class ImageViewer(Gtk.ApplicationWindow):
       self._status.set_text(f'Not a valid path: {path}')
       return False
 
+    self._folder = folder
     self._status.set_text('Scanning folder…')
     threading.Thread(
         target=self._scan_folder, args=(folder, start), daemon=True
@@ -362,6 +369,59 @@ class ImageViewer(Gtk.ApplicationWindow):
     self._images = images
     self._index = index
     self._show_current()
+    return False
+
+  def _refresh_folder(self) -> None:
+    if self._folder is None:
+      return
+    current_path = self._images[self._index] if self._images else None
+    self._status.set_text('Refreshing folder…')
+    threading.Thread(
+        target=self._scan_folder_for_refresh,
+        args=(self._folder, current_path),
+        daemon=True,
+    ).start()
+
+  def _scan_folder_for_refresh(
+      self, folder: Path, current_path: str | None) -> None:
+    with os.scandir(folder) as it:
+      images = sorted(
+          e.path
+          for e in it
+          if e.is_file(follow_symlinks=False)
+          and os.path.splitext(e.name)[1].lower() in SUPPORTED_EXTENSIONS
+      )
+    if not images:
+      GLib.idle_add(self._status.set_text, 'No images found in folder.')
+      return
+    index = 0
+    if current_path and current_path in images:
+      index = images.index(current_path)
+    GLib.idle_add(self._on_folder_refreshed, images, index)
+
+  def _on_folder_refreshed(self, images: list[str], index: int) -> bool:
+    new_set = set(images)
+    with self._cache_lock:
+      for key in list(self._cache):
+        if key not in new_set:
+          del self._cache[key]
+    self._images = images
+    self._index = index
+    self._gallery_populated_images = None
+    if self._gallery_mode:
+      self._gallery_selected = index
+      self._gallery_gen += 1
+      self._thumb_submitted.clear()
+      self._gallery_img_widgets.clear()
+      self._model = Gtk.StringList(strings=[])
+      self._gallery_selection = Gtk.SingleSelection(model=self._model)
+      self._gallery_selection.set_autoselect(False)
+      self._gallery_selection.connect(
+          'selection-changed', self._on_gallery_selection_changed)
+      self._grid_view.set_model(self._gallery_selection)
+      GLib.idle_add(self._populate_model_batch, 0, self._gallery_gen)
+    else:
+      self._show_current()
     return False
 
   def _get_settings_path(self) -> Path:
@@ -801,6 +861,11 @@ class ImageViewer(Gtk.ApplicationWindow):
         self._on_gallery_activate(self._grid_view, self._gallery_selected)
       elif keyval in (Gdk.KEY_g, Gdk.KEY_G, Gdk.KEY_Escape):
         self._close_gallery()
+      elif keyval in (Gdk.KEY_r, Gdk.KEY_R):
+        self._refresh_folder()
+      elif (keyval in (Gdk.KEY_c, Gdk.KEY_C)
+            and _state & Gdk.ModifierType.CONTROL_MASK):
+        self._copy_current_to_clipboard()
       return True
     if keyval in (Gdk.KEY_Right, Gdk.KEY_space, Gdk.KEY_n, Gdk.KEY_Page_Down):
       self._navigate(1)
@@ -830,12 +895,45 @@ class ImageViewer(Gtk.ApplicationWindow):
       self._toggle_dark_mode()
     elif keyval in (Gdk.KEY_g, Gdk.KEY_G):
       self._toggle_gallery()
+    elif keyval in (Gdk.KEY_r, Gdk.KEY_R):
+      self._refresh_folder()
+    elif (keyval in (Gdk.KEY_c, Gdk.KEY_C)
+          and _state & Gdk.ModifierType.CONTROL_MASK):
+      self._copy_current_to_clipboard()
     elif keyval in (Gdk.KEY_q, Gdk.KEY_Escape):
       if self._help_box.get_visible():
         self._set_help_visible(False)
       else:
         self._app.quit()
     return True
+
+  def _copy_current_to_clipboard(self) -> None:
+    """Copy the currently selected image to the system clipboard."""
+    if not self._images:
+      return
+    path = (self._images[self._gallery_selected]
+            if self._gallery_mode else self._images[self._index])
+    with self._cache_lock:
+      pixbuf = self._cache.get(path)
+    if pixbuf is not None:
+      self._set_clipboard_pixbuf(pixbuf)
+    else:
+      self._executor.submit(self._load_and_copy, path)
+
+  def _load_and_copy(self, path: str) -> None:
+    pixbuf = self._get_pixbuf(path)
+    if pixbuf is not None:
+      GLib.idle_add(self._set_clipboard_pixbuf, pixbuf)
+
+  def _set_clipboard_pixbuf(self, pixbuf: GdkPixbuf.Pixbuf) -> bool:
+    ok, buf = pixbuf.save_to_bufferv('png', [], [])
+    if not ok:
+      return False
+    gbytes = GLib.Bytes.new(buf)
+    provider = Gdk.ContentProvider.new_for_bytes('image/png', gbytes)
+    clipboard = Gdk.Display.get_default().get_clipboard()
+    clipboard.set_content(provider)
+    return False
 
   def _navigate(self, delta: int) -> None:
     if not self._images:
